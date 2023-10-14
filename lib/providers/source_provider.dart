@@ -28,6 +28,7 @@ import 'package:obtainium/app_sources/steammobile.dart';
 import 'package:obtainium/app_sources/telegramapp.dart';
 import 'package:obtainium/app_sources/uptodown.dart';
 import 'package:obtainium/app_sources/vlc.dart';
+import 'package:obtainium/app_sources/whatsapp.dart';
 import 'package:obtainium/components/generated_form.dart';
 import 'package:obtainium/custom_errors.dart';
 import 'package:obtainium/mass_app_sources/githubstars.dart';
@@ -328,6 +329,8 @@ abstract class AppSource {
   bool changeLogIfAnyIsMarkDown = true;
   bool appIdInferIsOptional = false;
   bool allowSubDomains = false;
+  bool naiveStandardVersionDetection = false;
+  bool neverAutoSelect = false;
 
   AppSource() {
     name = runtimeType.toString();
@@ -368,6 +371,10 @@ abstract class AppSource {
       {Map<String, dynamic> additionalSettings = const <String, dynamic>{},
       bool forAPKDownload = false}) async {
     return null;
+  }
+
+  App endOfGetAppChanges(App app) {
+    return app;
   }
 
   Future<Response> sourceRequest(String url,
@@ -440,6 +447,10 @@ abstract class AppSource {
     [
       GeneratedFormSwitch('exemptFromBackgroundUpdates',
           label: tr('exemptFromBackgroundUpdates'))
+    ],
+    [
+      GeneratedFormSwitch('skipUpdateNotifications',
+          label: tr('skipUpdateNotifications'))
     ]
   ];
 
@@ -535,6 +546,11 @@ intValidator(String? value, {bool positive = false}) {
   return null;
 }
 
+bool isTempId(App app) {
+  // return app.id == generateTempID(app.url, app.additionalSettings);
+  return RegExp('^[0-9]+\$').hasMatch(app.id);
+}
+
 class SourceProvider {
   // Add more source classes here so they are available via the service
   List<AppSource> get sources => [
@@ -556,7 +572,7 @@ class SourceProvider {
         Mullvad(),
         Signal(),
         VLC(),
-        // WhatsApp(), // As of 2023-03-20 this is unusable as the version on the webpage is months out of date
+        WhatsApp(), // As of 2023-03-20 this is unusable as the version on the webpage is months out of date
         TelegramApp(),
         SteamMobile(),
         NeutronCode(),
@@ -589,7 +605,7 @@ class SourceProvider {
       }
     }
     if (source == null) {
-      for (var s in sources.where((element) => element.host == null)) {
+      for (var s in sources.where((element) => element.host == null && !element.neverAutoSelect)) {
         try {
           s.sourceSpecificStandardizeURL(url);
           source = s;
@@ -619,11 +635,6 @@ class SourceProvider {
   String generateTempID(
           String standardUrl, Map<String, dynamic> additionalSettings) =>
       (standardUrl + additionalSettings.toString()).hashCode.toString();
-
-  bool isTempId(App app) {
-    // return app.id == generateTempID(app.url, app.additionalSettings);
-    return RegExp('^[0-9]+\$').hasMatch(app.id);
-  }
 
   Future<App> getApp(
       AppSource source, String url, Map<String, dynamic> additionalSettings,
@@ -666,7 +677,7 @@ class SourceProvider {
     String apkVersion = apk.version.replaceAll('/', '-');
     var name = currentApp != null ? currentApp.name.trim() : '';
     name = name.isNotEmpty ? name : apk.names.name;
-    return App(
+    App finalApp = App(
         currentApp?.id ??
             ((!source.appIdInferIsOptional ||
                     (source.appIdInferIsOptional && inferAppIdIfOptional))
@@ -692,6 +703,7 @@ class SourceProvider {
             source.appIdInferIsOptional &&
                 inferAppIdIfOptional // Optional ID inferring may be incorrect - allow correction on first install
         );
+    return source.endOfGetAppChanges(finalApp);
   }
 
   // Returns errors in [results, errors] instead of throwing them

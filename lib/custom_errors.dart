@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:android_package_installer/android_package_installer.dart';
 import 'package:easy_localization/easy_localization.dart';
 import 'package:flutter/material.dart';
@@ -65,30 +67,43 @@ class NotImplementedError extends ObtainiumError {
 }
 
 class MultiAppMultiError extends ObtainiumError {
-  Map<String, List<String>> content = {};
+  Map<String, dynamic> rawErrors = {};
+  Map<String, List<String>> idsByErrorString = {};
+  Map<String, String> appIdNames = {};
 
   MultiAppMultiError() : super(tr('placeholder'), unexpected: true);
 
-  add(String appId, String string) {
-    var tempIds = content.remove(string);
+  add(String appId, dynamic error, {String? appName}) {
+    if (error is SocketException) {
+      error = error.message;
+    }
+    rawErrors[appId] = error;
+    var string = error.toString();
+    var tempIds = idsByErrorString.remove(string);
     tempIds ??= [];
     tempIds.add(appId);
-    content.putIfAbsent(string, () => tempIds!);
+    idsByErrorString.putIfAbsent(string, () => tempIds!);
+    if (appName != null) {
+      appIdNames[appId] = appName;
+    }
   }
+
+  String errorString(String appId, {bool includeIdsWithNames = false}) =>
+      '${appIdNames.containsKey(appId) ? '${appIdNames[appId]}${includeIdsWithNames ? ' ($appId)' : ''}' : appId}: ${rawErrors[appId].toString()}';
+
+  String errorsAppsString(String errString, List<String> appIds,
+          {bool includeIdsWithNames = false}) =>
+      '$errString [${list2FriendlyString(appIds.map((id) => appIdNames.containsKey(id) == true ? '${appIdNames[id]}${includeIdsWithNames ? ' ($id)' : ''}' : id).toList())}]';
 
   @override
-  String toString() {
-    String finalString = '';
-    for (var e in content.keys) {
-      finalString += '$e: ${content[e].toString()}\n\n';
-    }
-    return finalString;
-  }
+  String toString() => idsByErrorString.entries
+      .map((e) => errorsAppsString(e.key, e.value))
+      .join('\n\n');
 }
 
-showError(dynamic e, BuildContext context) {
+showMessage(dynamic e, BuildContext context, {bool isError = false}) {
   Provider.of<LogsProvider>(context, listen: false)
-      .add(e.toString(), level: LogLevels.error);
+      .add(e.toString(), level: isError ? LogLevels.error : LogLevels.info);
   if (e is String || (e is ObtainiumError && !e.unexpected)) {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(e.toString())),
@@ -100,8 +115,8 @@ showError(dynamic e, BuildContext context) {
           return AlertDialog(
             scrollable: true,
             title: Text(e is MultiAppMultiError
-                ? tr('someErrors')
-                : tr('unexpectedError')),
+                ? tr(isError ? 'someErrors' : 'updates')
+                : tr(isError ? 'unexpectedError' : 'unknown')),
             content: GestureDetector(
                 onLongPress: () {
                   Clipboard.setData(ClipboardData(text: e.toString()));
@@ -120,6 +135,10 @@ showError(dynamic e, BuildContext context) {
           );
         });
   }
+}
+
+showError(dynamic e, BuildContext context) {
+  showMessage(e, context, isError: true);
 }
 
 String list2FriendlyString(List<String> list) {

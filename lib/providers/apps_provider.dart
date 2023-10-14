@@ -263,25 +263,29 @@ class AppsProvider with ChangeNotifier {
     return downloadedFile;
   }
 
-  Future<File> handleAPKIDChange(App app, PackageInfo newInfo,
+  Future<File> handleAPKIDChange(App app, PackageInfo? newInfo,
       File downloadedFile, String downloadUrl) async {
     // If the APK package ID is different from the App ID, it is either new (using a placeholder ID) or the ID has changed
     // The former case should be handled (give the App its real ID), the latter is a security issue
-    if (app.id != newInfo.packageName) {
-      var isTempId = SourceProvider().isTempId(app);
-      if (apps[app.id] != null && !isTempId && !app.allowIdChange) {
-        throw IDChangedError(newInfo.packageName!);
+    var isTempIdBool = isTempId(app);
+    if (newInfo != null) {
+      if (app.id != newInfo.packageName) {
+        if (apps[app.id] != null && !isTempIdBool && !app.allowIdChange) {
+          throw IDChangedError(newInfo.packageName!);
+        }
+        var idChangeWasAllowed = app.allowIdChange;
+        app.allowIdChange = false;
+        var originalAppId = app.id;
+        app.id = newInfo.packageName!;
+        downloadedFile = downloadedFile.renameSync(
+            '${downloadedFile.parent.path}/${app.id}-${downloadUrl.hashCode}.${downloadedFile.path.split('.').last}');
+        if (apps[originalAppId] != null) {
+          await removeApps([originalAppId]);
+          await saveApps([app], onlyIfExists: !isTempIdBool && !idChangeWasAllowed);
+        }
       }
-      var idChangeWasAllowed = app.allowIdChange;
-      app.allowIdChange = false;
-      var originalAppId = app.id;
-      app.id = newInfo.packageName!;
-      downloadedFile = downloadedFile.renameSync(
-          '${downloadedFile.parent.path}/${app.id}-${downloadUrl.hashCode}.${downloadedFile.path.split('.').last}');
-      if (apps[originalAppId] != null) {
-        await removeApps([originalAppId]);
-        await saveApps([app], onlyIfExists: !isTempId && !idChangeWasAllowed);
-      }
+    } else if (isTempIdBool) {
+      throw ObtainiumError('Could not get ID from APK');
     }
     return downloadedFile;
   }
@@ -344,7 +348,7 @@ class AppsProvider with ChangeNotifier {
             await pm.getPackageArchiveInfo(archiveFilePath: apks.first.path);
       }
       downloadedFile =
-          await handleAPKIDChange(app, newInfo!, downloadedFile, downloadUrl);
+          await handleAPKIDChange(app, newInfo, downloadedFile, downloadUrl);
       // Delete older versions of the file if any
       for (var file in downloadedFile.parent.listSync()) {
         var fn = file.path.split('/').last;
@@ -449,7 +453,7 @@ class AppsProvider with ChangeNotifier {
           } catch (e) {
             logs.add(
                 'Could not install APK from XAPK \'${file.path}\': ${e.toString()}');
-            errors.add(dir.appId, e.toString());
+            errors.add(dir.appId, e, appName: apps[dir.appId]?.name);
           }
         } else if (file.path.toLowerCase().endsWith('.obb')) {
           await moveObbFile(file, dir.appId);
@@ -457,7 +461,7 @@ class AppsProvider with ChangeNotifier {
       }
       if (somethingInstalled) {
         dir.file.delete(recursive: true);
-      } else if (errors.content.isNotEmpty) {
+      } else if (errors.idsByErrorString.isNotEmpty) {
         throw errors;
       }
     } finally {
@@ -677,11 +681,11 @@ class AppsProvider with ChangeNotifier {
         }
         installedIds.add(id);
       } catch (e) {
-        errors.add(id, e.toString());
+        errors.add(id, e, appName: apps[id]?.name);
       }
     }
 
-    if (errors.content.isNotEmpty) {
+    if (errors.idsByErrorString.isNotEmpty) {
       throw errors;
     }
 
@@ -709,14 +713,21 @@ class AppsProvider with ChangeNotifier {
   }
 
   bool isVersionDetectionPossible(AppInMemory? app) {
-    return app?.app.additionalSettings['trackOnly'] != true &&
-        app?.app.additionalSettings['versionDetection'] !=
+    if (app?.app == null) {
+      return false;
+    }
+    var naiveStandardVersionDetection = SourceProvider()
+        .getSource(app!.app.url, overrideSource: app.app.overrideSource)
+        .naiveStandardVersionDetection;
+    return app.app.additionalSettings['trackOnly'] != true &&
+        app.app.additionalSettings['versionDetection'] !=
             'releaseDateAsVersion' &&
-        app?.installedInfo?.versionName != null &&
-        app?.app.installedVersion != null &&
-        reconcileVersionDifferences(
-                app!.installedInfo!.versionName!, app.app.installedVersion!) !=
-            null;
+        app.installedInfo?.versionName != null &&
+        app.app.installedVersion != null &&
+        (reconcileVersionDifferences(app.installedInfo!.versionName!,
+                    app.app.installedVersion!) !=
+                null ||
+            naiveStandardVersionDetection);
   }
 
   // Given an App and it's on-device info...
@@ -725,8 +736,12 @@ class AppsProvider with ChangeNotifier {
       App app, PackageInfo? installedInfo) {
     var modded = false;
     var trackOnly = app.additionalSettings['trackOnly'] == true;
-    var noVersionDetection = app.additionalSettings['versionDetection'] !=
-        'standardVersionDetection';
+    var versionDetectionIsStandard =
+        app.additionalSettings['versionDetection'] ==
+            'standardVersionDetection';
+    var naiveStandardVersionDetection = SourceProvider()
+        .getSource(app.url, overrideSource: app.overrideSource)
+        .naiveStandardVersionDetection;
     // FIRST, COMPARE THE APP'S REPORTED AND REAL INSTALLED VERSIONS, WHERE ONE IS NULL
     if (installedInfo == null && app.installedVersion != null && !trackOnly) {
       // App says it's installed but isn't really (and isn't track only) - set to not installed
@@ -741,7 +756,7 @@ class AppsProvider with ChangeNotifier {
     // SECOND, RECONCILE DIFFERENCES BETWEEN THE APP'S REPORTED AND REAL INSTALLED VERSIONS, WHERE NEITHER IS NULL
     if (installedInfo?.versionName != null &&
         installedInfo!.versionName != app.installedVersion &&
-        !noVersionDetection) {
+        versionDetectionIsStandard) {
       // App's reported version and real version don't match (and it uses standard version detection)
       // If they share a standard format (and are still different under it), update the reported version accordingly
       var correctedInstalledVersion = reconcileVersionDifferences(
@@ -749,12 +764,15 @@ class AppsProvider with ChangeNotifier {
       if (correctedInstalledVersion?.key == false) {
         app.installedVersion = correctedInstalledVersion!.value;
         modded = true;
+      } else if (naiveStandardVersionDetection) {
+        app.installedVersion = installedInfo.versionName;
+        modded = true;
       }
     }
     // THIRD, RECONCILE THE APP'S REPORTED INSTALLED AND LATEST VERSIONS
     if (app.installedVersion != null &&
         app.installedVersion != app.latestVersion &&
-        !noVersionDetection) {
+        versionDetectionIsStandard) {
       // App's reported installed and latest versions don't match (and it uses standard version detection)
       // If they share a standard format, make sure the App's reported installed version uses that format
       var correctedInstalledVersion =
@@ -766,8 +784,7 @@ class AppsProvider with ChangeNotifier {
     }
     // FOURTH, DISABLE VERSION DETECTION IF ENABLED AND THE REPORTED/REAL INSTALLED VERSIONS ARE NOT STANDARDIZED
     if (installedInfo != null &&
-        app.additionalSettings['versionDetection'] ==
-            'standardVersionDetection' &&
+        versionDetectionIsStandard &&
         !isVersionDetectionPossible(
             AppInMemory(app, null, installedInfo, null))) {
       app.additionalSettings['versionDetection'] = 'noVersionDetection';
@@ -1055,7 +1072,8 @@ class AppsProvider with ChangeNotifier {
 
   Future<List<App>> checkUpdates(
       {DateTime? ignoreAppsCheckedAfter,
-      bool throwErrorsForRetry = false}) async {
+      bool throwErrorsForRetry = false,
+      List<String>? specificIds}) async {
     List<App> updates = [];
     MultiAppMultiError errors = MultiAppMultiError();
     if (!gettingUpdates) {
@@ -1063,27 +1081,33 @@ class AppsProvider with ChangeNotifier {
       try {
         List<String> appIds = getAppsSortedByUpdateCheckTime(
             ignoreAppsCheckedAfter: ignoreAppsCheckedAfter);
-        for (int i = 0; i < appIds.length; i++) {
+        if (specificIds != null) {
+          appIds = appIds.where((aId) => specificIds.contains(aId)).toList();
+        }
+        await Future.wait(appIds.map((appId) async {
           App? newApp;
           try {
-            newApp = await checkUpdate(appIds[i]);
+            newApp = await checkUpdate(appId);
           } catch (e) {
             if ((e is RateLimitError || e is SocketException) &&
                 throwErrorsForRetry) {
               rethrow;
             }
-            errors.add(appIds[i], e.toString());
+            errors.add(appId, e, appName: apps[appId]?.name);
           }
           if (newApp != null) {
             updates.add(newApp);
           }
-        }
+        }), eagerError: true);
       } finally {
         gettingUpdates = false;
       }
     }
-    if (errors.content.isNotEmpty) {
-      throw errors;
+    if (errors.idsByErrorString.isNotEmpty) {
+      var res = <String, dynamic>{};
+      res['errors'] = errors;
+      res['updates'] = updates;
+      throw res;
     }
     return updates;
   }
@@ -1116,7 +1140,6 @@ class AppsProvider with ChangeNotifier {
         return null;
       }
       if (exportDir == null) {
-        logs.add('Skipping auto-export as dir is not set.');
         return null;
       }
       var files = await saf
@@ -1300,22 +1323,21 @@ class _APKOriginWarningDialogState extends State<APKOriginWarningDialog> {
 
 /// Background updater function
 ///
-/// @param List<String>? toCheck: The appIds to check for updates (default to all apps sorted by last update check time)
+/// @param List<MapEntry<String, int>>? toCheck: The appIds to check for updates (with the number of previous attempts made per appid) (defaults to all apps)
 ///
-/// @param List<String>? toInstall: The appIds to attempt to update (defaults to an empty array)
-///
-/// @param int? attemptCount: The number of times the function has failed up to this point (defaults to 0)
+/// @param List<String>? toInstall: The appIds to attempt to update (if empty - which is the default - all pending updates are taken)
 ///
 /// When toCheck is empty, the function is in "install mode" (else it is in "update mode").
-/// In update mode, all apps in toCheck are checked for updates.
-/// If an update is available, the appId is either added to toInstall (if a background update is possible) or the user is notified.
-/// If there is an error, the function tries to continue after a few minutes (duration depends on the error), up to a maximum of 5 tries.
+/// In update mode, all apps in toCheck are checked for updates (in parallel).
+/// If an update is available and it cannot be installed silently, the user is notified of the available update.
+/// If there are any errors, the task is run again for the remaining apps after a few minutes (based on the error with the longest retry interval).
+/// Any app that has reached it's retry limit, the user is notified that it could not be checked.
 ///
-/// Once all update checks are complete, the function is called again in install mode.
-/// In this mode, all apps in toInstall are downloaded and installed in the background (install result is unknown).
-/// If there is an error, the function tries to continue after a few minutes (duration depends on the error), up to a maximum of 5 tries.
+/// Once all update checks are complete, the task is run again in install mode.
+/// In this mode, all pending silent updates are downloaded and installed in the background (serially - one at a time).
+/// If there is an error, the offending app is moved to the back of the line of remaining apps, and the task is retried.
+/// If an app repeatedly fails to install up to its retry limit, the user is notified.
 ///
-/// In either mode, if the function fails after the maximum number of tries, the user is notified.
 @pragma('vm:entry-point')
 Future<void> bgUpdateCheck(int taskId, Map<String, dynamic>? params) async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -1351,94 +1373,153 @@ Future<void> bgUpdateCheck(int taskId, Map<String, dynamic>? params) async {
         (<List<MapEntry<String, int>>>[]))
   ];
 
-  bool installMode = toCheck.isEmpty &&
-      toInstall.isNotEmpty; // Task is either in update mode or install mode
+  var netResult = await (Connectivity().checkConnectivity());
+
+  if (netResult == ConnectivityResult.none) {
+    var networkBasedRetryInterval = 15;
+    var nextRegularCheck = appsProvider.settingsProvider.lastBGCheckTime
+        .add(Duration(minutes: appsProvider.settingsProvider.updateInterval));
+    var potentialNetworkRetryCheck =
+        DateTime.now().add(Duration(minutes: networkBasedRetryInterval));
+    var shouldRetry = potentialNetworkRetryCheck.isBefore(nextRegularCheck);
+    logs.add(
+        'BG update task $taskId: No network. Will ${shouldRetry ? 'retry in $networkBasedRetryInterval minutes' : 'not retry'}.');
+    AndroidAlarmManager.oneShot(
+        const Duration(minutes: 15), taskId + 1, bgUpdateCheck,
+        params: {
+          'toCheck': toCheck
+              .map((entry) => {'key': entry.key, 'value': entry.value})
+              .toList(),
+          'toInstall': toInstall
+              .map((entry) => {'key': entry.key, 'value': entry.value})
+              .toList(),
+        });
+    return;
+  }
+
+  var networkRestricted = false;
+  if (appsProvider.settingsProvider.bgUpdatesOnWiFiOnly) {
+    networkRestricted = (netResult != ConnectivityResult.wifi) &&
+        (netResult != ConnectivityResult.ethernet);
+  }
+
+  bool installMode =
+      toCheck.isEmpty; // Task is either in update mode or install mode
 
   logs.add(
       'BG ${installMode ? 'install' : 'update'} task $taskId: Started (${installMode ? toInstall.length : toCheck.length}).');
 
   if (!installMode) {
-    // If in update mode...
-    var didCompleteChecking = false;
-    CheckingUpdatesNotification? notif;
+    // If in update mode, we check for updates.
+    // We divide the results into 4 groups:
+    // - toNotify - Apps with updates that the user will be notified about (can't be silently installed)
+    // - toRetry - Apps with update check errors that will be retried in a while
+    // - toThrow - Apps with update check errors that the user will be notified about (no retry)
+    // After grouping the updates, we take care of toNotify and toThrow first
+    // Then if toRetry is not empty, we schedule another update task to run in a while
+    // If toRetry is empty, we take care of schedule another task that will run in install mode (toCheck is empty)
+
+    // Init. vars.
+    List<App> updates = []; // All updates found (silent and non-silent)
+    List<App> toNotify =
+        []; // All non-silent updates that the user will be notified about
+    List<MapEntry<String, int>> toRetry =
+        []; // All apps that got errors while checking
+    var retryAfterXSeconds =
+        0; // How long to wait until the next attempt (if there are errors)
+    MultiAppMultiError?
+        errors; // All errors including those that will lead to a retry
+    MultiAppMultiError toThrow =
+        MultiAppMultiError(); // All errors that will not lead to a retry, just a notification
+    CheckingUpdatesNotification notif = CheckingUpdatesNotification(
+        plural('apps', toCheck.length)); // The notif. to show while checking
+
+    // Set a bool for when we're no on wifi/wired and the user doesn't want to download apps in that state
     var networkRestricted = false;
     if (appsProvider.settingsProvider.bgUpdatesOnWiFiOnly) {
       var netResult = await (Connectivity().checkConnectivity());
       networkRestricted = (netResult != ConnectivityResult.wifi) &&
           (netResult != ConnectivityResult.ethernet);
     }
-    // Loop through all updates and check each
-    List<App> toNotify = [];
+
     try {
-      for (int i = 0; i < toCheck.length; i++) {
-        var appId = toCheck[i].key;
-        var attemptCount = toCheck[i].value + 1;
-        AppInMemory? app = appsProvider.apps[appId];
-        if (app?.app.installedVersion != null) {
-          try {
-            notificationsProvider.notify(
-                notif = CheckingUpdatesNotification(app?.name ?? appId),
-                cancelExisting: true);
-            App? newApp = await appsProvider.checkUpdate(appId);
-            if (newApp != null) {
-              if (networkRestricted ||
-                  !(await appsProvider.canInstallSilently(app!.app))) {
-                toNotify.add(newApp);
-              } else {
-                toInstall.add(MapEntry(appId, 0));
-              }
+      // Check for updates
+      notificationsProvider.notify(notif, cancelExisting: true);
+      updates = await appsProvider.checkUpdates(
+          specificIds: toCheck.map((e) => e.key).toList());
+    } catch (e) {
+      // If there were errors, group them into toRetry and toThrow based on max retry count per app
+      if (e is Map) {
+        updates = e['updates'];
+        errors = e['errors'];
+        errors!.rawErrors.forEach((key, err) {
+          logs.add(
+              'BG update task $taskId: Got error on checking for $key \'${err.toString()}\'.');
+          var toCheckApp = toCheck.where((element) => element.key == key).first;
+          if (toCheckApp.value < maxAttempts) {
+            toRetry.add(MapEntry(toCheckApp.key, toCheckApp.value + 1));
+            // Next task interval is based on the error with the longest retry time
+            var minRetryIntervalForThisApp = err is RateLimitError
+                ? (err.remainingMinutes * 60)
+                : e is ClientException
+                    ? (15 * 60)
+                    : pow(toCheckApp.value + 1, 2).toInt();
+            if (minRetryIntervalForThisApp > retryAfterXSeconds) {
+              retryAfterXSeconds = minRetryIntervalForThisApp;
             }
-            if (i == (toCheck.length - 1)) {
-              didCompleteChecking = true;
-            }
-          } catch (e) {
-            // If you got an error, move the offender to the back of the line (increment their fail count) and schedule another task to continue checking shortly
-            logs.add(
-                'BG update task $taskId: Got error on checking for $appId \'${e.toString()}\'.');
-            if (attemptCount < maxAttempts) {
-              var remainingSeconds = e is RateLimitError
-                  ? (i == 0 ? (e.remainingMinutes * 60) : (5 * 60))
-                  : e is ClientException
-                      ? (15 * 60)
-                      : pow(attemptCount, 2).toInt();
-              logs.add(
-                  'BG update task $taskId: Will continue in $remainingSeconds seconds (with $appId moved to the end of the line).');
-              var remainingToCheck = moveStrToEndMapEntryWithCount(
-                  toCheck.sublist(i), MapEntry(appId, attemptCount));
-              AndroidAlarmManager.oneShot(Duration(seconds: remainingSeconds),
-                  taskId + 1, bgUpdateCheck,
-                  params: {
-                    'toCheck': remainingToCheck
-                        .map(
-                            (entry) => {'key': entry.key, 'value': entry.value})
-                        .toList(),
-                    'toInstall': toInstall
-                        .map(
-                            (entry) => {'key': entry.key, 'value': entry.value})
-                        .toList(),
-                  });
-              break;
-            } else {
-              // If the offender has reached its fail limit, notify the user and remove it from the list (task can continue)
-              toCheck.removeAt(i);
-              i--;
-              notificationsProvider
-                  .notify(ErrorCheckingUpdatesNotification(e.toString()));
-            }
-          } finally {
-            if (notif != null) {
-              notificationsProvider.cancel(notif.id);
-            }
+          } else {
+            toThrow.add(key, err, appName: errors?.appIdNames[key]);
           }
-        }
+        });
+      } else {
+        // We don't expect to ever get here in any situation so no need to catch (but log it in case)
+        logs.add('Fatal error in BG update task: ${e.toString()}');
+        rethrow;
       }
     } finally {
-      if (toNotify.isNotEmpty) {
-        notificationsProvider.notify(UpdateNotification(toNotify));
+      notificationsProvider.cancel(notif.id);
+    }
+
+    // Filter out updates that will be installed silently (the rest go into toNotify)
+    for (var i = 0; i < updates.length; i++) {
+      if (networkRestricted ||
+          !(await appsProvider.canInstallSilently(updates[i]))) {
+        if (updates[i].additionalSettings['skipUpdateNotifications'] != true) {
+          toNotify.add(updates[i]);
+        }
       }
     }
-    // If you're done checking and found some silently installable updates, schedule another task which will run in install mode
-    if (didCompleteChecking && toInstall.isNotEmpty) {
+
+    // Send the update notification
+    if (toNotify.isNotEmpty) {
+      notificationsProvider.notify(UpdateNotification(toNotify));
+    }
+
+    // Send the error notifications (grouped by error string)
+    if (toThrow.rawErrors.isNotEmpty) {
+      for (var element in toThrow.idsByErrorString.entries) {
+        notificationsProvider.notify(ErrorCheckingUpdatesNotification(
+            errors!.errorsAppsString(element.key, element.value),
+            id: Random().nextInt(10000)));
+      }
+    }
+
+    // if there are update checks to retry, schedule a retry task
+    if (toRetry.isNotEmpty) {
+      logs.add(
+          'BG update task $taskId: Will retry in $retryAfterXSeconds seconds.');
+      AndroidAlarmManager.oneShot(
+          Duration(seconds: retryAfterXSeconds), taskId + 1, bgUpdateCheck,
+          params: {
+            'toCheck': toRetry
+                .map((entry) => {'key': entry.key, 'value': entry.value})
+                .toList(),
+            'toInstall': toInstall
+                .map((entry) => {'key': entry.key, 'value': entry.value})
+                .toList(),
+          });
+    } else {
+      // If there are no more update checks, schedule an install task
       logs.add(
           'BG update task $taskId: Done. Scheduling install task to run immediately.');
       AndroidAlarmManager.oneShot(
@@ -1449,11 +1530,19 @@ Future<void> bgUpdateCheck(int taskId, Map<String, dynamic>? params) async {
                 .map((entry) => {'key': entry.key, 'value': entry.value})
                 .toList()
           });
-    } else if (didCompleteChecking) {
-      logs.add('BG install task $taskId: Done.');
     }
   } else {
-    // If in install mode...
+    // In install mode...
+    // If you haven't explicitly been given updates to install (which is the case for new tasks), grab all available silent updates
+    if (toInstall.isEmpty && !networkRestricted) {
+      var temp = appsProvider.findExistingUpdates(installedOnly: true);
+      for (var i = 0; i < temp.length; i++) {
+        if (await appsProvider
+            .canInstallSilently(appsProvider.apps[temp[i]]!.app)) {
+          toInstall.add(MapEntry(temp[i], 0));
+        }
+      }
+    }
     var didCompleteInstalling = false;
     var tempObtArr = toInstall.where((element) => element.key == obtainiumId);
     if (tempObtArr.isNotEmpty) {
@@ -1505,9 +1594,9 @@ Future<void> bgUpdateCheck(int taskId, Map<String, dynamic>? params) async {
               .notify(ErrorCheckingUpdatesNotification(e.toString()));
         }
       }
-      if (didCompleteInstalling) {
-        logs.add('BG install task $taskId: Done.');
-      }
+    }
+    if (didCompleteInstalling || toInstall.isEmpty) {
+      logs.add('BG install task $taskId: Done.');
     }
   }
 }
